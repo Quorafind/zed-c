@@ -21,7 +21,7 @@ use crate::{
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
     TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
     TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
+    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowPostProcess, WindowTextSystem,
     WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
 };
 
@@ -4548,6 +4548,18 @@ impl Window {
         }
 
         result
+    }
+
+    /// Sets the post-process effect applied to the whole window once the frame
+    /// currently being drawn has been rendered. Passing `None` disables it.
+    ///
+    /// The effect only lasts for the current frame, so it has to be set again
+    /// on every frame for as long as it should be visible.
+    ///
+    /// Only the Windows DirectX renderer honors this; the other platform
+    /// renderers ignore it.
+    pub fn set_window_post_process(&mut self, post_process: Option<WindowPostProcess>) {
+        self.next_frame.scene.set_window_post_process(post_process);
     }
 
     /// Paint the drop (non-inset) shadows from `shadows` into the scene at the current
