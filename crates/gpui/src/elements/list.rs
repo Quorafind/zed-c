@@ -10,8 +10,8 @@
 use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Edges, Element, EntityId,
     FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
-    Overflow, Pixels, Point, ScrollDelta, ScrollWheelEvent, Size, Style, StyleRefinement, Styled,
-    Window, point, px, size,
+    Overflow, Pixels, Point, ScrollWheelEvent, Size, Style, StyleRefinement, Styled, Window, point,
+    px, size,
 };
 use collections::VecDeque;
 use refineable::Refineable as _;
@@ -1604,21 +1604,25 @@ impl Element for List {
         // div-based scroll containers.
         let list_state = self.state.clone();
         let height = bounds.size.height;
-        let scroll_top = prepaint.layout.scroll_top;
+        let painted_scroll_top = prepaint.layout.scroll_top;
         let hitbox_id = prepaint.hitbox.id;
-        let mut accumulated_scroll_delta = ScrollDelta::default();
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
-                accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
-                let pixel_delta = accumulated_scroll_delta.pixel_delta(px(20.));
-                list_state.0.borrow_mut().scroll(
-                    &scroll_top,
-                    height,
-                    pixel_delta,
-                    current_view,
-                    window,
-                    cx,
-                )
+                let mut state = list_state.0.borrow_mut();
+                // Each event moves the list from where it is now. Starting every
+                // event of a frame from the painted position (and adding up the
+                // frame's deltas) threw the viewport back whenever the items or the
+                // scroll position changed before the next paint: a splice shifts
+                // item indices and a `scroll_to` moves the top, but the painted
+                // offset still names the old ones. Only a top that is not a
+                // concrete item — the tail anchor or no position at all — needs
+                // the painted layout to be resolved to pixels.
+                let scroll_top = state
+                    .logical_scroll_top
+                    .filter(|top| top.item_ix < state.items.summary().count)
+                    .unwrap_or(painted_scroll_top);
+                let pixel_delta = event.delta.pixel_delta(px(20.));
+                state.scroll(&scroll_top, height, pixel_delta, current_view, window, cx)
             }
         });
 
@@ -1734,8 +1738,8 @@ mod test {
 
     use crate::{
         self as gpui, AppContext, Bounds, Context, Element, FollowMode, InteractiveElement,
-        IntoElement, ListState, Render, Styled, TestAppContext, Window, canvas, div, list, point,
-        px, size,
+        IntoElement, ListOffset, ListState, Pixels, Render, Styled, TestAppContext,
+        VisualTestContext, Window, canvas, div, list, point, px, size,
     };
 
     #[test]
@@ -2035,6 +2039,86 @@ mod test {
             .w_full()
             .h_full()
         }
+    }
+
+    fn draw_test_list(cx: &mut VisualTestContext, state: &ListState) {
+        let state = state.clone();
+        cx.draw(
+            point(px(0.), px(0.)),
+            size(px(100.), px(100.)),
+            move |_, cx| cx.new(|_| TestListView(state)).into_any_element(),
+        );
+    }
+
+    fn wheel_test_list(cx: &mut VisualTestContext, dy: Pixels) {
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(50.), px(50.)),
+            delta: ScrollDelta::Pixels(point(px(0.), dy)),
+            ..Default::default()
+        });
+    }
+
+    #[gpui::test]
+    fn test_wheel_after_splice_before_repaint_scrolls_from_the_live_position(
+        cx: &mut TestAppContext,
+    ) {
+        let cx = cx.add_empty_window();
+        let state = ListState::new(100, crate::ListAlignment::Top, px(0.)).measure_all();
+        draw_test_list(cx, &state);
+        state.scroll_to(ListOffset {
+            item_ix: 10,
+            offset_in_item: px(5.),
+        });
+        draw_test_list(cx, &state);
+
+        // Rows land above the reader and the list is not repainted before the
+        // next wheel event, as when a history page is prepended mid-gesture.
+        state.splice(0..0, 5);
+        assert_eq!(state.logical_scroll_top().item_ix, 15);
+        wheel_test_list(cx, px(-10.));
+
+        let offset = state.logical_scroll_top();
+        assert_eq!(offset.item_ix, 15);
+        assert_eq!(offset.offset_in_item, px(15.));
+    }
+
+    #[gpui::test]
+    fn test_wheel_after_scroll_to_before_repaint_scrolls_from_the_new_position(
+        cx: &mut TestAppContext,
+    ) {
+        let cx = cx.add_empty_window();
+        let state = ListState::new(100, crate::ListAlignment::Top, px(0.)).measure_all();
+        draw_test_list(cx, &state);
+
+        state.scroll_to(ListOffset {
+            item_ix: 30,
+            offset_in_item: px(0.),
+        });
+        wheel_test_list(cx, px(-10.));
+
+        let offset = state.logical_scroll_top();
+        assert_eq!(offset.item_ix, 30);
+        assert_eq!(offset.offset_in_item, px(10.));
+    }
+
+    #[gpui::test]
+    fn test_wheel_events_within_one_frame_add_up(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let state = ListState::new(100, crate::ListAlignment::Top, px(0.)).measure_all();
+        draw_test_list(cx, &state);
+
+        wheel_test_list(cx, px(-10.));
+        wheel_test_list(cx, px(-15.));
+        let offset = state.logical_scroll_top();
+        assert_eq!(offset.item_ix, 1);
+        assert_eq!(offset.offset_in_item, px(5.));
+
+        // Reversing direction within the frame moves back from where the
+        // earlier events left the list.
+        wheel_test_list(cx, px(5.));
+        let offset = state.logical_scroll_top();
+        assert_eq!(offset.item_ix, 1);
+        assert_eq!(offset.offset_in_item, px(0.));
     }
 
     #[gpui::test]
