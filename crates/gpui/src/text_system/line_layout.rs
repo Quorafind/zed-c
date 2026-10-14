@@ -170,7 +170,13 @@ impl LineLayout {
                     last_candidate_x = x;
                 }
             } else {
-                if ch != ' ' && first_non_whitespace_ix.is_some() {
+                // Not before closing punctuation or after an opening bracket (避头尾), as in
+                // `LineWrapper::wrap_line`.
+                if ch != ' '
+                    && first_non_whitespace_ix.is_some()
+                    && !LineWrapper::may_not_open_line(ch)
+                    && !LineWrapper::may_not_close_line(prev_ch)
+                {
                     last_candidate_ix = Some(boundary);
                     last_candidate_x = x;
                 }

@@ -71,8 +71,15 @@ impl LineWrapper {
                                 last_candidate_width = width;
                             }
                         } else {
-                            // CJK may not be space separated, e.g.: `Hello world你好世界`
-                            if c != ' ' && first_non_whitespace_ix.is_some() {
+                            // CJK may not be space separated, e.g.: `Hello world你好世界`.
+                            // But not before closing punctuation (。，」…) or after an opening
+                            // bracket (「（…): a line never starts with the one or ends with the
+                            // other (避头尾), so the character before moves down with it.
+                            if c != ' '
+                                && first_non_whitespace_ix.is_some()
+                                && !Self::may_not_open_line(c)
+                                && !Self::may_not_close_line(prev_c)
+                            {
                                 last_candidate_ix = ix;
                                 last_candidate_width = width;
                             }
@@ -447,6 +454,17 @@ impl LineWrapper {
 
     /// Any character in this list should be treated as a word character,
     /// meaning it can be part of a word that should not be wrapped.
+    /// Punctuation a line may not start with: closing marks, CJK and Latin.
+    pub(crate) fn may_not_open_line(c: char) -> bool {
+        "，。、；：！？）」』】》〉〕］｝”’…—・·ー々ゝゞヽヾぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮヵヶ,.;:!?)]}%"
+            .contains(c)
+    }
+
+    /// Punctuation a line may not end with: opening marks.
+    pub(crate) fn may_not_close_line(c: char) -> bool {
+        "（「『【《〈〔［｛“‘([{".contains(c)
+    }
+
     pub(crate) fn is_word_char(c: char) -> bool {
         // ASCII alphanumeric characters, for English, numbers: `Hello123`, etc.
         c.is_ascii_alphanumeric() ||
@@ -707,6 +725,26 @@ mod tests {
                 ..Default::default()
             })
             .collect()
+    }
+
+    #[test]
+    fn test_wrap_line_keeps_cjk_punctuation_off_line_edges() {
+        let mut wrapper = build_wrapper();
+        let text = "我小时候常去那里看。纸从帘子上揭下来的时候还是湿的，薄得透光「贴在墙上」晒干，第二天就能写字了。";
+        for width in [40., 56., 72., 90., 110., 140.] {
+            for boundary in wrapper.wrap_line(&[LineFragment::text(text)], px(width)) {
+                let next = text[boundary.ix..].chars().next().unwrap();
+                let before = text[..boundary.ix].chars().last().unwrap();
+                assert!(
+                    !LineWrapper::may_not_open_line(next),
+                    "a line starts with {next:?} at width {width}"
+                );
+                assert!(
+                    !LineWrapper::may_not_close_line(before),
+                    "a line ends with {before:?} at width {width}"
+                );
+            }
+        }
     }
 
     #[test]
