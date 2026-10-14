@@ -1,6 +1,6 @@
 use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
-    HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
+    HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
     TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine,
     WrappedLineLayout, register_tooltip_mouse_handlers, set_tooltip_on_window,
@@ -984,6 +984,7 @@ pub struct InteractiveText {
     click_listener:
         Option<Box<dyn Fn(&[Range<usize>], InteractiveTextClickEvent, &mut Window, &mut App)>>,
     hover_listener: Option<Box<dyn Fn(Option<usize>, MouseMoveEvent, &mut Window, &mut App)>>,
+    pointer_listener: Option<Rc<dyn Fn(InteractiveTextPointerEvent, &mut Window, &mut App)>>,
     tooltip_builder: Option<Rc<dyn Fn(usize, &mut Window, &mut App) -> Option<AnyView>>>,
     tooltip_id: Option<TooltipId>,
     clickable_ranges: Vec<Range<usize>>,
@@ -992,6 +993,28 @@ pub struct InteractiveText {
 struct InteractiveTextClickEvent {
     mouse_down_index: usize,
     mouse_up_index: usize,
+}
+
+/// The phase of a pointer interaction with shaped text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InteractiveTextPointerPhase {
+    /// The primary mouse button was pressed.
+    Begin,
+    /// The pointer moved while the primary mouse button was held.
+    Update,
+    /// The primary mouse button was released.
+    End,
+}
+
+/// A hit-tested pointer event whose index is a UTF-8 byte offset in the source text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InteractiveTextPointerEvent {
+    /// The nearest shaped-text caret index.
+    pub index: usize,
+    /// The interaction phase.
+    pub phase: InteractiveTextPointerPhase,
+    /// The bounds of the interactive text element that received the event.
+    pub bounds: Bounds<Pixels>,
 }
 
 #[doc(hidden)]
@@ -1011,6 +1034,7 @@ impl InteractiveText {
             text,
             click_listener: None,
             hover_listener: None,
+            pointer_listener: None,
             tooltip_builder: None,
             tooltip_id: None,
             clickable_ranges: Vec::new(),
@@ -1043,6 +1067,17 @@ impl InteractiveText {
         listener: impl Fn(Option<usize>, MouseMoveEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.hover_listener = Some(Box::new(listener));
+        self
+    }
+
+    /// Registers primary-button pointer callbacks with caret indices resolved by the shaped text
+    /// layout. Updates continue to work when a drag crosses between multiple interactive text
+    /// elements because each hovered element reports its own source index.
+    pub fn on_pointer(
+        mut self,
+        listener: impl Fn(InteractiveTextPointerEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.pointer_listener = Some(Rc::new(listener));
         self
     }
 
@@ -1135,6 +1170,80 @@ impl Element for InteractiveText {
             global_id.unwrap(),
             |interactive_state, window| {
                 let mut interactive_state = interactive_state.unwrap_or_default();
+                if let Some(pointer_listener) = self.pointer_listener.take() {
+                    if hitbox.is_hovered(window) {
+                        window.set_cursor_style(crate::CursorStyle::IBeam, hitbox);
+                    }
+
+                    let pointer_hitbox = hitbox.clone();
+                    let pointer_layout = text_layout.clone();
+                    let listener = pointer_listener.clone();
+                    window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Bubble
+                            && event.button == MouseButton::Left
+                            && pointer_hitbox.is_hovered(window)
+                        {
+                            let index = pointer_layout
+                                .index_for_position(event.position)
+                                .unwrap_or_else(|index| index);
+                            listener(
+                                InteractiveTextPointerEvent {
+                                    index,
+                                    phase: InteractiveTextPointerPhase::Begin,
+                                    bounds: pointer_hitbox.bounds,
+                                },
+                                window,
+                                cx,
+                            );
+                        }
+                    });
+
+                    let pointer_hitbox = hitbox.clone();
+                    let pointer_layout = text_layout.clone();
+                    let listener = pointer_listener.clone();
+                    window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Bubble
+                            && event.dragging()
+                            && pointer_hitbox.is_hovered(window)
+                        {
+                            let index = pointer_layout
+                                .index_for_position(event.position)
+                                .unwrap_or_else(|index| index);
+                            listener(
+                                InteractiveTextPointerEvent {
+                                    index,
+                                    phase: InteractiveTextPointerPhase::Update,
+                                    bounds: pointer_hitbox.bounds,
+                                },
+                                window,
+                                cx,
+                            );
+                        }
+                    });
+
+                    let pointer_hitbox = hitbox.clone();
+                    let pointer_layout = text_layout.clone();
+                    window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Bubble
+                            && event.button == MouseButton::Left
+                            && pointer_hitbox.is_hovered(window)
+                        {
+                            let index = pointer_layout
+                                .index_for_position(event.position)
+                                .unwrap_or_else(|index| index);
+                            pointer_listener(
+                                InteractiveTextPointerEvent {
+                                    index,
+                                    phase: InteractiveTextPointerPhase::End,
+                                    bounds: pointer_hitbox.bounds,
+                                },
+                                window,
+                                cx,
+                            );
+                        }
+                    });
+                }
+
                 if let Some(click_listener) = self.click_listener.take() {
                     let mouse_position = window.mouse_position();
                     if let Ok(ix) = text_layout.index_for_position(mouse_position)
