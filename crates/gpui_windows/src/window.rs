@@ -926,7 +926,8 @@ impl PlatformWindow for WindowsWindow {
             WindowBackgroundAppearance::Transparent => {
                 set_window_composition_attribute(hwnd, None, 2);
             }
-            WindowBackgroundAppearance::Blurred => {
+            // No Liquid Glass here: it falls back to the blur.
+            WindowBackgroundAppearance::Blurred | WindowBackgroundAppearance::LiquidGlass => {
                 set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 4);
             }
             WindowBackgroundAppearance::MicaBackdrop => {

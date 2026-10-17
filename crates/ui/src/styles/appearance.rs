@@ -18,5 +18,6 @@ pub fn theme_is_transparent(cx: &mut App) -> bool {
             | WindowBackgroundAppearance::Blurred
             | WindowBackgroundAppearance::MicaBackdrop
             | WindowBackgroundAppearance::MicaAltBackdrop
+            | WindowBackgroundAppearance::LiquidGlass
     )
 }

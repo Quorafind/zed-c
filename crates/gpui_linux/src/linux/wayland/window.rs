@@ -2320,7 +2320,11 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
     }
 
     if let Some(ref blur_manager) = state.globals.blur_manager {
-        if state.background_appearance == WindowBackgroundAppearance::Blurred {
+        // No Liquid Glass here: it falls back to the blur.
+        if matches!(
+            state.background_appearance,
+            WindowBackgroundAppearance::Blurred | WindowBackgroundAppearance::LiquidGlass
+        ) {
             if state.blur.is_none() {
                 let blur = blur_manager.create(&state.surface, &state.globals.qh, ());
                 state.blur = Some(blur);
