@@ -1658,6 +1658,7 @@ impl PlatformWindow for MacWindow {
 
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         let mut this = self.0.as_ref().lock();
+        let previous_appearance = this.background_appearance;
         this.background_appearance = background_appearance;
 
         let opaque = background_appearance == WindowBackgroundAppearance::Opaque;
@@ -1673,15 +1674,29 @@ impl PlatformWindow for MacWindow {
             };
             this.native_window.setBackgroundColor_(background_color);
 
-            if background_appearance != WindowBackgroundAppearance::Blurred {
+            let wants_backdrop = matches!(
+                background_appearance,
+                WindowBackgroundAppearance::Blurred | WindowBackgroundAppearance::LiquidGlass
+            );
+            // A different material needs a different view, not the old one.
+            if !wants_backdrop || previous_appearance != background_appearance {
                 if let Some(blur_view) = this.blurred_view {
                     NSView::removeFromSuperview(blur_view);
                     this.blurred_view = None;
                 }
-            } else if this.blurred_view.is_none() {
+            }
+            if wants_backdrop && this.blurred_view.is_none() {
                 let content_view = this.native_window.contentView();
                 let frame = NSView::bounds(content_view);
-                let mut blur_view: id = msg_send![BLURRED_VIEW_CLASS, alloc];
+                // `NSGlassEffectView` only exists from macOS 26; looked up at
+                // run time so older systems fall back to the blurred view.
+                let glass_class = (background_appearance
+                    == WindowBackgroundAppearance::LiquidGlass)
+                    .then(|| Class::get("NSGlassEffectView"))
+                    .flatten();
+                let backdrop_class =
+                    glass_class.map_or(BLURRED_VIEW_CLASS, |class| class as *const Class);
+                let mut blur_view: id = msg_send![backdrop_class, alloc];
                 blur_view = NSView::initWithFrame_(blur_view, frame);
                 blur_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable);
 

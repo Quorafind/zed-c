@@ -2245,6 +2245,10 @@ pub enum WindowBackgroundAppearance {
     MicaBackdrop,
     /// The Mica Alt backdrop material, supported on Windows 11.
     MicaAltBackdrop,
+    /// The system's Liquid Glass material behind the whole window, where the
+    /// system has one (macOS 26 and later). Elsewhere it falls back to
+    /// [`Self::Blurred`].
+    LiquidGlass,
 }
 
 /// The text rendering mode to use for drawing glyphs.

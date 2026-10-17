@@ -2747,6 +2747,11 @@ impl Window {
         self.platform_window.set_app_id(app_id);
     }
 
+    /// The background appearance the window was last given.
+    pub fn background_appearance(&self) -> WindowBackgroundAppearance {
+        self.platform_window.background_appearance()
+    }
+
     /// Sets the window background appearance.
     pub fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         self.platform_window
