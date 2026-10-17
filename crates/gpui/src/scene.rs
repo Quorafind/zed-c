@@ -87,6 +87,9 @@ pub struct Scene {
     /// Kept separate from the drawable primitives: each one breaks the render
     /// pass rather than being drawn in it. See [`BackdropBlur`].
     pub backdrop_blurs: Vec<BackdropBlur>,
+    /// Like `backdrop_blurs`, each one breaks the render pass. See
+    /// [`LiquidGlass`].
+    pub liquid_glasses: Vec<LiquidGlass>,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
@@ -105,6 +108,7 @@ impl Scene {
         self.layer_stack.clear();
         self.window_post_process = None;
         self.backdrop_blurs.clear();
+        self.liquid_glasses.clear();
         self.paths.clear();
         self.shadows.clear();
         self.quads.clear();
@@ -163,6 +167,10 @@ impl Scene {
                 blur.order = order;
                 self.backdrop_blurs.push(*blur);
             }
+            Primitive::LiquidGlass(glass) => {
+                glass.order = order;
+                self.liquid_glasses.push(*glass);
+            }
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
                 self.shadows.push(*shadow);
@@ -213,6 +221,7 @@ impl Scene {
 
     pub fn finish(&mut self) {
         self.backdrop_blurs.sort_by_key(|blur| blur.order);
+        self.liquid_glasses.sort_by_key(|glass| glass.order);
         self.shadows.sort_by_key(|shadow| shadow.order);
         self.quads.sort_by_key(|quad| quad.order);
         self.paths.sort_by_key(|path| path.order);
@@ -237,6 +246,8 @@ impl Scene {
         BatchIterator {
             backdrop_blurs_start: 0,
             backdrop_blurs_iter: self.backdrop_blurs.iter().peekable(),
+            liquid_glasses_start: 0,
+            liquid_glasses_iter: self.liquid_glasses.iter().peekable(),
             shadows_start: 0,
             shadows_iter: self.shadows.iter().peekable(),
             quads_start: 0,
@@ -269,6 +280,9 @@ pub(crate) enum PrimitiveKind {
     /// Ordered ahead of every drawable kind: at equal order the backdrop has to
     /// be resolved before anything paints over it.
     BackdropBlur,
+    /// Resolved against the backdrop like `BackdropBlur`, so it sorts ahead of
+    /// the drawable kinds too.
+    LiquidGlass,
     Shadow,
     #[default]
     Quad,
@@ -290,6 +304,7 @@ pub(crate) enum PaintOperation {
 #[expect(missing_docs)]
 pub enum Primitive {
     BackdropBlur(BackdropBlur),
+    LiquidGlass(LiquidGlass),
     Shadow(Shadow),
     Quad(Quad),
     Path(Path<ScaledPixels>),
@@ -305,6 +320,7 @@ impl Primitive {
     pub fn bounds(&self) -> &Bounds<ScaledPixels> {
         match self {
             Primitive::BackdropBlur(blur) => &blur.bounds,
+            Primitive::LiquidGlass(glass) => &glass.bounds,
             Primitive::Shadow(shadow) => &shadow.bounds,
             Primitive::Quad(quad) => &quad.bounds,
             Primitive::Path(path) => &path.bounds,
@@ -319,6 +335,7 @@ impl Primitive {
     pub fn content_mask(&self) -> &ContentMask<ScaledPixels> {
         match self {
             Primitive::BackdropBlur(blur) => &blur.content_mask,
+            Primitive::LiquidGlass(glass) => &glass.content_mask,
             Primitive::Shadow(shadow) => &shadow.content_mask,
             Primitive::Quad(quad) => &quad.content_mask,
             Primitive::Path(path) => &path.content_mask,
@@ -341,6 +358,8 @@ impl Primitive {
 struct BatchIterator<'a> {
     backdrop_blurs_start: usize,
     backdrop_blurs_iter: Peekable<slice::Iter<'a, BackdropBlur>>,
+    liquid_glasses_start: usize,
+    liquid_glasses_iter: Peekable<slice::Iter<'a, LiquidGlass>>,
     shadows_start: usize,
     shadows_iter: Peekable<slice::Iter<'a, Shadow>>,
     quads_start: usize,
@@ -367,6 +386,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.backdrop_blurs_iter.peek().map(|b| b.order),
                 PrimitiveKind::BackdropBlur,
+            ),
+            (
+                self.liquid_glasses_iter.peek().map(|g| g.order),
+                PrimitiveKind::LiquidGlass,
             ),
             (
                 self.shadows_iter.peek().map(|s| s.order),
@@ -414,6 +437,15 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.backdrop_blurs_iter.next();
                 self.backdrop_blurs_start = start + 1;
                 Some(PrimitiveBatch::BackdropBlurs(start..start + 1))
+            }
+            // One per batch for the same reason: a pane of glass refracts a
+            // target that already holds every earlier batch, including any
+            // glass beneath it.
+            PrimitiveKind::LiquidGlass => {
+                let start = self.liquid_glasses_start;
+                self.liquid_glasses_iter.next();
+                self.liquid_glasses_start = start + 1;
+                Some(PrimitiveBatch::LiquidGlasses(start..start + 1))
             }
             PrimitiveKind::Shadow => {
                 let shadows_start = self.shadows_start;
@@ -563,6 +595,7 @@ impl<'a> Iterator for BatchIterator<'a> {
 #[allow(missing_docs)]
 pub enum PrimitiveBatch {
     BackdropBlurs(Range<usize>),
+    LiquidGlasses(Range<usize>),
     Shadows(Range<usize>),
     Quads(Range<usize>),
     Paths(Range<usize>),
@@ -588,6 +621,7 @@ impl PrimitiveBatch {
     pub fn label(&self) -> String {
         match self {
             Self::BackdropBlurs(range) => format!("backdrop blurs ({})", range.len()),
+            Self::LiquidGlasses(range) => format!("liquid glasses ({})", range.len()),
             Self::Shadows(range) => format!("shadows ({})", range.len()),
             Self::Quads(range) => format!("quads ({})", range.len()),
             Self::Paths(range) => format!("paths ({})", range.len()),
@@ -644,6 +678,119 @@ pub struct BackdropBlur {
 impl From<BackdropBlur> for Primitive {
     fn from(blur: BackdropBlur) -> Self {
         Primitive::BackdropBlur(blur)
+    }
+}
+
+/// A pane of liquid glass: what has already been painted beneath `bounds`,
+/// seen through a slab of glass with a rounded bevel.
+///
+/// Like [`BackdropBlur`], this is resolved against the target where it lands
+/// in the paint order, so everything painted afterwards composites on top.
+/// The renderer snapshots the target, optionally blurs it, and redraws the
+/// region through the glass: the bevel bends the rays (refraction, split per
+/// channel for dispersion), and the rim catches a specular highlight from a
+/// light direction and, optionally, from the pointer.
+///
+/// Built by [`crate::Window::paint_liquid_glass`], which falls back to a blur,
+/// tint and rim on renderers that cannot draw it. All lengths are in scaled
+/// (device) pixels.
+#[derive(Default, Debug, Copy, Clone)]
+#[repr(C)]
+pub struct LiquidGlass {
+    /// Where this sits in paint order — what "already painted" means for it.
+    pub order: DrawOrder,
+    /// The pane, in scaled pixels.
+    pub bounds: Bounds<ScaledPixels>,
+    /// The clip in force where this was requested.
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// Corners of the pane.
+    pub corner_radii: Corners<ScaledPixels>,
+    /// The colour the glass is tinted toward; its alpha is the strength.
+    pub tint: Hsla,
+    /// Gaussian sigma of the frosting. Zero leaves the glass clear.
+    pub blur_sigma: ScaledPixels,
+    /// How far in from the edge the bevel reaches. Inside it the glass is
+    /// flat and shows the backdrop undistorted.
+    pub bezel_width: ScaledPixels,
+    /// Thickness of the slab: with the refractive index, how far the bevel
+    /// shifts what is behind it.
+    pub thickness: ScaledPixels,
+    /// Refractive index of the glass. 1.0 bends nothing.
+    pub refractive_index: f32,
+    /// How far the red and blue channels part at the rim, as a fraction of
+    /// the shift. Zero keeps them together.
+    pub dispersion: f32,
+    /// Saturation of the backdrop seen through the glass; 1.0 leaves it.
+    pub saturation: f32,
+    /// Direction the light comes from, in radians, clockwise from the
+    /// positive x axis in screen space (y down).
+    pub light_angle: f32,
+    /// Strength of the specular rim highlight. Zero turns it off.
+    pub highlight: f32,
+    /// The pointer, which lights the glass near it. Only read while
+    /// `pointer_glow` is positive.
+    pub pointer: Point<ScaledPixels>,
+    /// Strength of the pointer's light. Zero turns it off.
+    pub pointer_glow: f32,
+}
+
+impl From<LiquidGlass> for Primitive {
+    fn from(glass: LiquidGlass) -> Self {
+        Primitive::LiquidGlass(glass)
+    }
+}
+
+/// How a pane of liquid glass looks, in logical pixels. See
+/// [`crate::Window::paint_liquid_glass`].
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct LiquidGlassStyle {
+    /// The colour the glass is tinted toward; its alpha is the strength.
+    pub tint: Hsla,
+    /// Gaussian sigma of the frosting. Zero leaves the glass clear.
+    pub blur: Pixels,
+    /// How far in from the edge the bevel reaches.
+    pub bezel_width: Pixels,
+    /// Thickness of the slab: with the refractive index, how far the bevel
+    /// shifts what is behind it.
+    pub thickness: Pixels,
+    /// Refractive index of the glass. 1.0 bends nothing.
+    pub refractive_index: f32,
+    /// How far the red and blue channels part at the rim, as a fraction of
+    /// the shift.
+    pub dispersion: f32,
+    /// Saturation of the backdrop seen through the glass; 1.0 leaves it.
+    pub saturation: f32,
+    /// Direction the light comes from, clockwise from the positive x axis in
+    /// screen space (y down). The default lights the top-left rim.
+    pub light_angle: Radians,
+    /// Strength of the specular rim highlight. Zero turns it off.
+    pub highlight: f32,
+    /// The pointer, in window coordinates, if it should light the glass.
+    pub pointer: Option<Point<Pixels>>,
+    /// Strength of the pointer's light.
+    pub pointer_glow: f32,
+}
+
+impl Default for LiquidGlassStyle {
+    fn default() -> Self {
+        Self {
+            tint: Hsla {
+                h: 0.,
+                s: 0.,
+                l: 1.,
+                a: 0.06,
+            },
+            blur: Pixels(1.5),
+            bezel_width: Pixels(14.),
+            thickness: Pixels(18.),
+            refractive_index: 1.5,
+            dispersion: 0.12,
+            saturation: 1.35,
+            light_angle: Radians(-2.36),
+            highlight: 0.7,
+            pointer: None,
+            pointer_glow: 0.5,
+        }
     }
 }
 
@@ -1106,6 +1253,78 @@ mod tests {
 
         scene.clear();
         assert_eq!(scene.window_post_process(), None);
+    }
+
+    fn scaled_bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds::new(
+            point(ScaledPixels(x), ScaledPixels(y)),
+            crate::size(ScaledPixels(width), ScaledPixels(height)),
+        )
+    }
+
+    fn whole_window() -> ContentMask<ScaledPixels> {
+        ContentMask {
+            bounds: scaled_bounds(0., 0., 1000., 1000.),
+        }
+    }
+
+    fn quad_at(bounds: Bounds<ScaledPixels>) -> Quad {
+        Quad {
+            bounds,
+            content_mask: whole_window(),
+            ..Default::default()
+        }
+    }
+
+    fn glass_at(bounds: Bounds<ScaledPixels>) -> LiquidGlass {
+        LiquidGlass {
+            bounds,
+            content_mask: whole_window(),
+            ..Default::default()
+        }
+    }
+
+    fn batch_labels(scene: &Scene) -> Vec<String> {
+        scene.batches().map(|batch| batch.label()).collect()
+    }
+
+    #[test]
+    fn test_liquid_glass_splits_the_quads_beneath_from_those_above() {
+        let mut scene = Scene::default();
+        let pane = scaled_bounds(10., 10., 100., 40.);
+        scene.insert_primitive(quad_at(pane));
+        scene.insert_primitive(glass_at(pane));
+        scene.insert_primitive(quad_at(pane));
+        scene.finish();
+
+        assert_eq!(
+            batch_labels(&scene),
+            ["quads (1)", "liquid glasses (1)", "quads (1)"]
+        );
+    }
+
+    #[test]
+    fn test_liquid_glasses_never_share_a_batch() {
+        let mut scene = Scene::default();
+        // Side by side, so both land at the same order.
+        scene.insert_primitive(glass_at(scaled_bounds(0., 0., 50., 50.)));
+        scene.insert_primitive(glass_at(scaled_bounds(100., 0., 50., 50.)));
+        scene.finish();
+
+        assert_eq!(
+            batch_labels(&scene),
+            ["liquid glasses (1)", "liquid glasses (1)"]
+        );
+    }
+
+    #[test]
+    fn test_clear_drops_liquid_glasses() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(glass_at(scaled_bounds(0., 0., 50., 50.)));
+        assert_eq!(scene.liquid_glasses.len(), 1);
+
+        scene.clear();
+        assert!(scene.liquid_glasses.is_empty());
     }
 
     #[test]

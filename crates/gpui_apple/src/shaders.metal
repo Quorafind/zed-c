@@ -959,6 +959,171 @@ fragment float4 backdrop_blur_fragment(
   return float4(sample.rgb, coverage);
 }
 
+struct LiquidGlassVertexOutput {
+  uint glass_id [[flat]];
+  float4 position [[position]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct LiquidGlassFragmentInput {
+  uint glass_id [[flat]];
+  float4 position [[position]];
+};
+
+vertex LiquidGlassVertexOutput liquid_glass_vertex(
+    uint unit_vertex_id [[vertex_id]], uint glass_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(LiquidGlassInputIndex_Vertices)]],
+    constant LiquidGlass *glasses [[buffer(LiquidGlassInputIndex_Glasses)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(LiquidGlassInputIndex_ViewportSize)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  LiquidGlass glass = glasses[glass_id];
+  float4 device_position =
+      to_device_position(unit_vertex, glass.bounds, viewport_size);
+  float4 clip_distance = distance_from_clip_rect(unit_vertex, glass.bounds,
+                                                 glass.content_mask.bounds);
+  return LiquidGlassVertexOutput{
+      glass_id,
+      device_position,
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+}
+
+// Height of the bevel at `t` of the way in from the edge, from 0 at the edge
+// to 1 where the flat top starts: a convex squircle, steep at the rim and
+// easing into the top so the join shows no crease.
+float liquid_glass_height(float t) {
+  float r = 1.0 - t;
+  return pow(max(1.0 - r * r * r * r, 0.0), 0.25);
+}
+
+// The pane-of-glass pass. As for the backdrop blur, the renderer has already
+// snapshotted the frame so far (and blurred it, for frosted glass); this
+// redraws the pane as that backdrop seen through a slab with a rounded bevel.
+//
+// The slab is a height field over the pane: flat in the middle, falling to
+// zero at the rim across `bezel_width`. A ray straight down through a point of
+// the bevel refracts at the tilted surface (Snell, at `refractive_index`) and
+// lands on the backdrop displaced toward the middle by however far it travels
+// sideways through the glass under it — nothing where the top is flat, most
+// part way down the bevel, where the slope is steep and the glass still
+// thick. Red and blue land a little apart (`dispersion`). The rim then catches
+// light: a hairline and a softer sheen along the bevel, brightest where it
+// faces `light_angle`, a weaker reflection on the opposite rim, and a glow
+// around the pointer.
+fragment float4 liquid_glass_fragment(
+    LiquidGlassFragmentInput input [[stage_in]],
+    constant LiquidGlass *glasses [[buffer(LiquidGlassInputIndex_Glasses)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(LiquidGlassInputIndex_ViewportSize)]],
+    texture2d<float> backdrop [[texture(LiquidGlassInputIndex_Backdrop)]]) {
+  LiquidGlass glass = glasses[input.glass_id];
+  float2 p = input.position.xy;
+  float distance = quad_sdf(p, glass.bounds, glass.corner_radii);
+  float coverage = saturate(0.5 - distance);
+  if (coverage <= 0.) {
+    return float4(0.);
+  }
+
+  // Outward normal of the rim nearest this point, from the distance field.
+  const float e = 0.5;
+  float2 gradient = float2(
+      quad_sdf(p + float2(e, 0.), glass.bounds, glass.corner_radii) -
+          quad_sdf(p - float2(e, 0.), glass.bounds, glass.corner_radii),
+      quad_sdf(p + float2(0., e), glass.bounds, glass.corner_radii) -
+          quad_sdf(p - float2(0., e), glass.bounds, glass.corner_radii));
+  float gradient_length = length(gradient);
+  float2 outward =
+      gradient_length > 1e-5 ? gradient / gradient_length : float2(0., -1.);
+
+  float depth = max(-distance, 0.);
+  float bezel = max(glass.bezel_width, 1e-3);
+  float t = saturate(depth / bezel);
+  float in_bezel = t < 1.0 ? 1.0 : 0.0;
+
+  // Surface height and slope (rise per pixel inward) of the bevel.
+  float thickness = glass.thickness;
+  float height = thickness * liquid_glass_height(t);
+  const float dt = 1e-3;
+  float slope =
+      in_bezel * thickness *
+      (liquid_glass_height(min(t + dt, 1.0)) - liquid_glass_height(max(t - dt, 0.0))) /
+      ((min(t + dt, 1.0) - max(t - dt, 0.0)) * bezel);
+  // The edge itself is vertical; cap the tilt short of that.
+  slope = min(slope, 12.0);
+
+  // The surface falls away outward, so its normal leans outward.
+  float3 normal = normalize(float3(outward * slope, 1.0));
+  float3 ray = refract(float3(0., 0., -1.), normal, 1.0 / glass.refractive_index);
+  float2 shift = ray.z < -1e-4 ? ray.xy * (height / -ray.z) : float2(0.);
+
+  constexpr sampler backdrop_sampler(mag_filter::linear, min_filter::linear,
+                                     address::clamp_to_edge);
+  float2 viewport = float2((float)viewport_size->width,
+                           (float)viewport_size->height);
+  // Keep every sample on the pane: past its edge the frosted backdrop was
+  // never blurred.
+  float2 lo = float2(glass.bounds.origin.x, glass.bounds.origin.y) + 0.5;
+  float2 hi = lo + float2(glass.bounds.size.width, glass.bounds.size.height) - 1.0;
+  float spread = glass.dispersion;
+  float2 at_r = clamp(p + shift * (1.0 - spread), lo, hi) / viewport;
+  float2 at_g = clamp(p + shift, lo, hi) / viewport;
+  float2 at_b = clamp(p + shift * (1.0 + spread), lo, hi) / viewport;
+  // The target holds premultiplied colour. In an opaque window its alpha is
+  // 1 and this is the colour itself; in a transparent one, what shows through
+  // the glass may be partly or wholly the desktop behind the window, which
+  // the system composites later and this pass cannot see.
+  float4 centre = backdrop.sample(backdrop_sampler, at_g);
+  float3 premultiplied = centre.rgb;
+  if (spread > 1e-4) {
+    premultiplied.r = backdrop.sample(backdrop_sampler, at_r).r;
+    premultiplied.b = backdrop.sample(backdrop_sampler, at_b).b;
+  }
+  float behind_alpha = saturate(centre.a);
+  float3 color = behind_alpha > 1e-4 ? saturate(premultiplied / behind_alpha) : float3(0.);
+
+  // Glass deepens what it shows a little, then takes its tint.
+  float luma = dot(color, float3(0.2126, 0.7152, 0.0722));
+  color = saturate(mix(float3(luma), color, glass.saturation));
+  float4 tint = hsla_to_rgba(glass.tint);
+  // Tint over what is behind, in premultiplied terms, so a transparent
+  // backdrop stays transparent under clear glass instead of turning black.
+  float3 result = tint.rgb * tint.a + color * behind_alpha * (1.0 - tint.a);
+  float result_alpha = tint.a + behind_alpha * (1.0 - tint.a);
+
+  // Specular rim. `facing` is how squarely this stretch of rim faces the
+  // light; the far rim catches a weaker, internally reflected copy.
+  float2 light = float2(cos(glass.light_angle), sin(glass.light_angle));
+  float facing = dot(outward, light);
+  float lit = pow(saturate(facing), 2.0) + 0.4 * pow(saturate(-facing), 2.0);
+  float line_width = clamp(bezel * 0.1, 0.75, 2.5);
+  float hairline = exp(-depth / line_width);
+  float sheen = in_bezel * (1.0 - t) * (1.0 - t);
+  float specular =
+      glass.highlight * (hairline * (0.3 + 0.7 * lit) + sheen * 0.35 * lit);
+
+  if (glass.pointer_glow > 0.) {
+    float2 pointer = float2(glass.pointer.x, glass.pointer.y);
+    float2 to_pointer = pointer - p;
+    float reach = max(min(glass.bounds.size.width, glass.bounds.size.height) * 0.75,
+                      bezel * 3.0);
+    float glow = glass.pointer_glow *
+                 exp(-dot(to_pointer, to_pointer) / (2.0 * reach * reach));
+    float toward = length(to_pointer) > 1e-3
+                       ? saturate(dot(outward, normalize(to_pointer)))
+                       : 0.0;
+    specular += glow * ((hairline + sheen * 0.6) * (0.35 + 0.65 * toward) + 0.06);
+  }
+  // The highlight is light the glass itself gives off: it adds colour and
+  // the coverage to carry it.
+  result = saturate(result + specular);
+  result_alpha = saturate(result_alpha + specular);
+  if (result_alpha <= 1e-4) {
+    return float4(0.);
+  }
+  // The pipeline blends by source alpha, so hand it straight colour.
+  return float4(saturate(result / result_alpha), result_alpha * coverage);
+}
+
 float4 hsla_to_rgba(Hsla hsla) {
   float h = hsla.h * 6.0; // Now, it's an angle but scaled in [0, 6) range
   float s = hsla.s;

@@ -7,8 +7,8 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, BackdropBlur, Background, Bounds, ContentMask, DevicePixels, PaintSurface,
-    Path, Point, PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
+    AtlasTextureId, BackdropBlur, Background, Bounds, ContentMask, DevicePixels, LiquidGlass,
+    PaintSurface, Path, Point, PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -131,6 +131,7 @@ pub struct MetalRenderer {
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
     backdrop_blurs_pipeline_state: metal::RenderPipelineState,
+    liquid_glasses_pipeline_state: metal::RenderPipelineState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -344,6 +345,14 @@ impl MetalRenderer {
             "backdrop_blur_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let liquid_glasses_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "liquid_glasses",
+            "liquid_glass_vertex",
+            "liquid_glass_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
@@ -367,6 +376,7 @@ impl MetalRenderer {
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
             backdrop_blurs_pipeline_state,
+            liquid_glasses_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -776,6 +786,25 @@ impl MetalRenderer {
                         None,
                     );
                 }
+                PrimitiveBatch::LiquidGlasses(range) => {
+                    // Glass refracts the target as it stands: the same pass
+                    // break as the backdrop blur.
+                    command_encoder.end_encoding();
+                    self.draw_liquid_glasses(
+                        &scene.liquid_glasses[range.clone()],
+                        range.start,
+                        instance_bindings,
+                        texture,
+                        viewport_size,
+                        command_buffer,
+                    );
+                    command_encoder = new_command_encoder_for_texture(
+                        command_buffer,
+                        texture,
+                        viewport_size,
+                        None,
+                    );
+                }
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             }
         }
@@ -808,7 +837,7 @@ impl MetalRenderer {
         };
 
         for (index, blur) in blurs.iter().enumerate() {
-            let Some(region) = backdrop_region(blur, texture) else {
+            let Some(region) = backdrop_region(&blur.bounds, texture) else {
                 continue;
             };
             // Snapshot the target as it stands. Whole rather than the pane's
@@ -865,6 +894,102 @@ impl MetalRenderer {
             );
             command_encoder
                 .set_fragment_texture(BackdropBlurInputIndex::Blurred as u64, Some(&blurred));
+            command_encoder.draw_primitives_instanced_base_instance(
+                metal::MTLPrimitiveType::Triangle,
+                0,
+                6,
+                1,
+                (first_instance + index) as u64,
+            );
+            command_encoder.end_encoding();
+        }
+    }
+
+    /// Draw each pane of glass in this batch through the target as it stands
+    /// when its turn comes, so glass stacked on glass refracts the lower
+    /// pane's result. See [`LiquidGlass`].
+    fn draw_liquid_glasses(
+        &mut self,
+        glasses: &[LiquidGlass],
+        first_instance: usize,
+        instance_bindings: &InstanceBindings,
+        texture: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+        command_buffer: &metal::CommandBufferRef,
+    ) {
+        if glasses.is_empty() {
+            return;
+        }
+        let (scratch, blurred) = self.backdrop_textures(texture);
+        let whole = metal::MTLSize {
+            width: texture.width(),
+            height: texture.height(),
+            depth: 1,
+        };
+
+        for (index, glass) in glasses.iter().enumerate() {
+            let Some(region) = backdrop_region(&glass.bounds, texture) else {
+                continue;
+            };
+            // Whole, as for the blur: the bevel bends rays inward, but a
+            // frosted pane's kernel reaches past its edge.
+            let blit = command_buffer.new_blit_command_encoder();
+            blit.copy_from_texture(
+                texture,
+                0,
+                0,
+                metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                whole,
+                &scratch,
+                0,
+                0,
+                metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            );
+            blit.end_encoding();
+            // Clear glass reads the snapshot itself; frosted glass reads its
+            // gaussian, written only inside the pane.
+            let source = if glass.blur_sigma.0 > 0. {
+                self.gaussian_kernel(glass.blur_sigma.0).encode(
+                    command_buffer,
+                    &scratch,
+                    &blurred,
+                    region,
+                );
+                &blurred
+            } else {
+                &scratch
+            };
+
+            let command_encoder =
+                new_command_encoder_for_texture(command_buffer, texture, viewport_size, None);
+            command_encoder.set_render_pipeline_state(&self.liquid_glasses_pipeline_state);
+            command_encoder.set_vertex_buffer(
+                LiquidGlassInputIndex::Vertices as u64,
+                Some(&self.unit_vertices),
+                0,
+            );
+            command_encoder.set_vertex_buffer(
+                LiquidGlassInputIndex::Glasses as u64,
+                Some(&instance_bindings.liquid_glasses.buffer),
+                instance_bindings.liquid_glasses.offset as u64,
+            );
+            command_encoder.set_vertex_bytes(
+                LiquidGlassInputIndex::ViewportSize as u64,
+                mem::size_of_val(&viewport_size) as u64,
+                &viewport_size as *const Size<DevicePixels> as *const _,
+            );
+            command_encoder.set_fragment_buffer(
+                LiquidGlassInputIndex::Glasses as u64,
+                Some(&instance_bindings.liquid_glasses.buffer),
+                instance_bindings.liquid_glasses.offset as u64,
+            );
+            command_encoder.set_fragment_bytes(
+                LiquidGlassInputIndex::ViewportSize as u64,
+                mem::size_of_val(&viewport_size) as u64,
+                &viewport_size as *const Size<DevicePixels> as *const _,
+            );
+            command_encoder
+                .set_fragment_texture(LiquidGlassInputIndex::Backdrop as u64, Some(source));
             command_encoder.draw_primitives_instanced_base_instance(
                 metal::MTLPrimitiveType::Triangle,
                 0,
@@ -1433,13 +1558,16 @@ fn new_command_encoder_for_texture<'a>(
 
 /// The pixels of the target a blur rewrites: its bounds, clamped to the
 /// target. `None` when nothing of it is on screen.
-fn backdrop_region(blur: &BackdropBlur, target: &metal::TextureRef) -> Option<metal::MTLRegion> {
-    let left = blur.bounds.origin.x.0.floor().max(0.);
-    let top = blur.bounds.origin.y.0.floor().max(0.);
-    let right = (blur.bounds.origin.x.0 + blur.bounds.size.width.0)
+fn backdrop_region(
+    bounds: &Bounds<ScaledPixels>,
+    target: &metal::TextureRef,
+) -> Option<metal::MTLRegion> {
+    let left = bounds.origin.x.0.floor().max(0.);
+    let top = bounds.origin.y.0.floor().max(0.);
+    let right = (bounds.origin.x.0 + bounds.size.width.0)
         .ceil()
         .min(target.width() as f32);
-    let bottom = (blur.bounds.origin.y.0 + blur.bounds.size.height.0)
+    let bottom = (bounds.origin.y.0 + bounds.size.height.0)
         .ceil()
         .min(target.height() as f32);
     if right <= left || bottom <= top {
@@ -1680,12 +1808,14 @@ struct InstanceBindings {
     polychrome_sprites: InstanceBinding,
     surfaces: InstanceBinding,
     backdrop_blurs: InstanceBinding,
+    liquid_glasses: InstanceBinding,
 }
 
 fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<InstanceBindings> {
     Ok(InstanceBindings {
         quads: writer.write(&scene.quads)?,
         backdrop_blurs: writer.write(&scene.backdrop_blurs)?,
+        liquid_glasses: writer.write(&scene.liquid_glasses)?,
         shadows: writer.write(&scene.shadows)?,
         underlines: writer.write(&scene.underlines)?,
         monochrome_sprites: writer.write(&scene.monochrome_sprites)?,
@@ -1866,6 +1996,14 @@ enum SurfaceInputIndex {
     TextureSize = 3,
     YTexture = 4,
     CbCrTexture = 5,
+}
+
+#[repr(C)]
+enum LiquidGlassInputIndex {
+    Vertices = 0,
+    Glasses = 1,
+    ViewportSize = 2,
+    Backdrop = 3,
 }
 
 #[repr(C)]

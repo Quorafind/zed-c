@@ -1534,6 +1534,9 @@ impl WgpuRenderer {
                     // dropping the batch leaves a plain panel rather than a
                     // hole. See `BackdropBlur`.
                     PrimitiveBatch::BackdropBlurs(_) => {}
+                    // Never reaches here: `Window::paint_liquid_glass` paints
+                    // a fallback where `supports_liquid_glass` is false.
+                    PrimitiveBatch::LiquidGlasses(_) => {}
                 }
             }
         }

@@ -57,6 +57,8 @@ mod macos_build {
             "BorderStyle".into(),
             "BackdropBlur".into(),
             "BackdropBlurInputIndex".into(),
+            "LiquidGlass".into(),
+            "LiquidGlassInputIndex".into(),
             "SpriteInputIndex".into(),
             "MonochromeSprite".into(),
             "PolychromeSprite".into(),

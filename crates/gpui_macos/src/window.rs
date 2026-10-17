@@ -1704,6 +1704,11 @@ impl PlatformWindow for MacWindow {
         false
     }
 
+    // The Metal renderer resolves `LiquidGlass` batches.
+    fn supports_liquid_glass(&self) -> bool {
+        true
+    }
+
     fn set_edited(&mut self, edited: bool) {
         unsafe {
             let window = self.0.lock().native_window;
