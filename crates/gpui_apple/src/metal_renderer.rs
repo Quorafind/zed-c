@@ -1459,6 +1459,15 @@ fn backdrop_region(blur: &BackdropBlur, target: &metal::TextureRef) -> Option<me
     })
 }
 
+/// `MPSOffset`: three `NSInteger`s.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MpsOffset {
+    x: isize,
+    y: isize,
+    z: isize,
+}
+
 /// An `MPSImageGaussianBlur` — Apple's separable gaussian, exact at any
 /// sigma. Owned: the object is released with the kernel.
 struct GaussianKernel(*mut objc::runtime::Object);
@@ -1490,8 +1499,18 @@ impl GaussianKernel {
         destination: &metal::TextureRef,
         region: metal::MTLRegion,
     ) {
+        // The clip rect only says where to write. Which source pixel lands at
+        // its origin is `offset`, which defaults to the source's origin, so
+        // without it every pane showed the window's top-left corner instead
+        // of what is behind it.
+        let offset = MpsOffset {
+            x: region.origin.x as isize,
+            y: region.origin.y as isize,
+            z: 0,
+        };
         unsafe {
             let _: () = msg_send![self.0, setClipRect: region];
+            let _: () = msg_send![self.0, setOffset: offset];
             let _: () = msg_send![
                 self.0,
                 encodeToCommandBuffer: command_buffer.as_ptr() as *mut objc::runtime::Object
