@@ -1529,6 +1529,28 @@ fn backdrop_region(blur: &BackdropBlur, target: &metal::TextureRef) -> Option<me
     })
 }
 
+/// `MPSOffset`: three `NSInteger`s.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MpsOffset {
+    x: isize,
+    y: isize,
+    z: isize,
+}
+
+// SAFETY: `MpsOffset` is `repr(C)` with the same three `NSInteger` fields
+// as `MPSOffset`, an anonymous struct, hence the `?` name.
+unsafe impl objc2::Encode for MpsOffset {
+    const ENCODING: objc2::Encoding = objc2::Encoding::Struct(
+        "?",
+        &[
+            <isize as objc2::Encode>::ENCODING,
+            <isize as objc2::Encode>::ENCODING,
+            <isize as objc2::Encode>::ENCODING,
+        ],
+    );
+}
+
 /// An `MPSImageGaussianBlur` — Apple's separable gaussian, exact at any
 /// sigma. Owned: the object is released with the kernel.
 struct GaussianKernel(objc2::rc::Retained<AnyObject>);
@@ -1573,8 +1595,18 @@ impl GaussianKernel {
                 depth: region.size.depth as usize,
             },
         };
+        // The clip rect only says where to write. Which source pixel lands at
+        // its origin is `offset`, which defaults to the source's origin, so
+        // without it every pane showed the window's top-left corner instead
+        // of what is behind it.
+        let offset = MpsOffset {
+            x: region.origin.x as isize,
+            y: region.origin.y as isize,
+            z: 0,
+        };
         unsafe {
             let _: () = objc2::msg_send![&*self.0, setClipRect: region];
+            let _: () = objc2::msg_send![&*self.0, setOffset: offset];
             let _: () = objc2::msg_send![
                 &*self.0,
                 encodeToCommandBuffer: command_buffer.as_ptr() as *mut AnyObject,
