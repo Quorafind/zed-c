@@ -389,6 +389,10 @@ impl DirectXRenderer {
                 PrimitiveBatch::BackdropBlurs(range) => {
                     self.draw_backdrop_blurs(&scene.backdrop_blurs[range])
                 }
+                // Never reaches here: `Window::paint_liquid_glass` paints a
+                // blur, tint and rim instead where `supports_liquid_glass` is
+                // false, as it is on this backend.
+                PrimitiveBatch::LiquidGlasses(_) => Ok(()),
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
                 PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
                 PrimitiveBatch::Paths(range) => {

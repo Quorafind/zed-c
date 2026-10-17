@@ -6,24 +6,23 @@ use crate::Inspector;
 use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
-    Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
+    AsyncWindowContext, AtlasTile, AvailableSpace, BackdropBlur, Background, BorderStyle, Bounds,
+    BoxShadow, Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
-    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
+    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, LiquidGlass, LiquidGlassStyle, Modifiers, ModifiersChangedEvent,
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
     RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    BackdropBlur,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
     TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
     TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowPostProcess, WindowTextSystem,
-    WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
+    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowPostProcess,
+    WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -4739,6 +4738,107 @@ impl Window {
                 bottom_left: corner_radii.bottom_left.min(limit),
             },
             sigma: sigma.scale(scale_factor),
+        });
+    }
+
+    /// Whether this window's renderer draws liquid glass itself. Where it
+    /// does not, [`Self::paint_liquid_glass`] paints a blur, tint and rim
+    /// instead, so a caller only needs this to tune that fallback.
+    pub fn supports_liquid_glass(&self) -> bool {
+        self.platform_window.supports_liquid_glass()
+    }
+
+    /// Paint a pane of liquid glass over whatever has already been painted
+    /// beneath `bounds`, for the next frame at the current stacking context.
+    ///
+    /// Like [`Self::paint_backdrop_blur`], content painted *before* this call
+    /// is what the glass shows, refracted through its bevel, and content
+    /// painted *after* it composites on top. A panel calls this first and then
+    /// paints its children.
+    ///
+    /// On a renderer without the capability (see
+    /// [`Self::supports_liquid_glass`]) this degrades on its own to a backdrop
+    /// blur, where that is drawn, under a tint and a light rim.
+    ///
+    /// This method should only be called as part of the paint phase of element
+    /// drawing.
+    pub fn paint_liquid_glass(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        style: LiquidGlassStyle,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        if !self.supports_liquid_glass() {
+            self.paint_liquid_glass_fallback(bounds, corner_radii, &style);
+            return;
+        }
+
+        let scale_factor = self.scale_factor();
+        let snapped = self.snap_bounds(bounds);
+        // Past half the shorter side the rounded-rect distance reads every
+        // fragment as outside, as with the backdrop blur.
+        let limit = snapped.size.width.min(snapped.size.height) / 2.;
+        let corner_radii = corner_radii.scale(scale_factor);
+        let pointer = style.pointer.unwrap_or_default();
+        self.next_frame.scene.insert_primitive(LiquidGlass {
+            order: 0,
+            bounds: snapped,
+            content_mask: self.snapped_content_mask(),
+            corner_radii: Corners {
+                top_left: corner_radii.top_left.min(limit),
+                top_right: corner_radii.top_right.min(limit),
+                bottom_right: corner_radii.bottom_right.min(limit),
+                bottom_left: corner_radii.bottom_left.min(limit),
+            },
+            tint: style.tint,
+            blur_sigma: style.blur.max(px(0.)).scale(scale_factor),
+            // A bevel wider than the pane's half-width would meet itself.
+            bezel_width: style.bezel_width.max(px(0.)).scale(scale_factor).min(limit),
+            thickness: style.thickness.max(px(0.)).scale(scale_factor),
+            refractive_index: style.refractive_index.max(1.),
+            dispersion: style.dispersion.max(0.),
+            saturation: style.saturation.max(0.),
+            light_angle: style.light_angle.0,
+            highlight: style.highlight.max(0.),
+            pointer: point(pointer.x.scale(scale_factor), pointer.y.scale(scale_factor)),
+            pointer_glow: if style.pointer.is_some() {
+                style.pointer_glow.max(0.)
+            } else {
+                0.
+            },
+        });
+    }
+
+    /// Liquid glass without refraction: a blur where the renderer draws one,
+    /// then a tint strong enough to read as a surface and a rim lit by the
+    /// highlight.
+    fn paint_liquid_glass_fallback(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        style: &LiquidGlassStyle,
+    ) {
+        if style.blur > px(0.) {
+            self.paint_backdrop_blur(bounds, corner_radii, style.blur);
+        }
+        let mut tint = style.tint;
+        // Clear glass reads as nothing without the bevel; keep a veil.
+        tint.a = tint.a.max(0.12);
+        let rim = Hsla {
+            h: 0.,
+            s: 0.,
+            l: 1.,
+            a: (0.12 + 0.3 * style.highlight).min(0.5),
+        };
+        self.paint_quad(PaintQuad {
+            bounds,
+            corner_radii,
+            background: tint.into(),
+            border_widths: Edges::all(px(1.)),
+            border_color: rim,
+            border_style: BorderStyle::Solid,
         });
     }
 

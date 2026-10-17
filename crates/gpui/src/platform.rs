@@ -1277,6 +1277,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn schedule_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
+    /// Whether this window's renderer draws [`crate::LiquidGlass`]. Where it
+    /// does not, [`crate::Window::paint_liquid_glass`] paints a fallback.
+    fn supports_liquid_glass(&self) -> bool {
+        false
+    }
 
     // macOS specific methods
     fn get_title(&self) -> String {
