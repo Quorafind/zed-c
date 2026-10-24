@@ -351,6 +351,7 @@ impl<'a> ShapedLineCursor<'a> {
                     len,
                     color: decoration.color,
                     background_color: decoration.background_color,
+                    background_radius: decoration.background_radius,
                     underline: decoration.underline,
                     strikethrough: decoration.strikethrough,
                 });
@@ -1156,6 +1157,7 @@ mod tests {
                 len: 1,
                 color: black(),
                 background_color: None,
+                background_radius: None,
                 underline: Some(first_style),
                 strikethrough: None,
             };
@@ -1299,6 +1301,7 @@ mod tests {
                 len: 1,
                 color: black(),
                 background_color: None,
+                background_radius: None,
                 underline: Some(first_style),
                 strikethrough: None,
             };
@@ -1377,6 +1380,7 @@ mod tests {
                         len: 4,
                         color: black(),
                         background_color: None,
+                        background_radius: None,
                         underline: Some(style),
                         strikethrough: None,
                     }],
@@ -1889,6 +1893,7 @@ mod tests {
                     a: 1.0,
                 },
                 background_color: None,
+                background_radius: None,
                 underline: None,
                 strikethrough: None,
             }],
@@ -1912,6 +1917,7 @@ mod tests {
                     a: 1.0,
                 },
                 background_color: Some(black()),
+                background_radius: None,
                 underline: None,
                 strikethrough: None,
             })
